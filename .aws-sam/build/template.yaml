@@ -1,0 +1,133 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Telegram AI Finance Bot serverless stack
+Globals:
+  Function:
+    Runtime: python3.12
+    MemorySize: 512
+    Tracing: Active
+    Environment:
+      Variables:
+        TELEGRAM_TOKEN:
+          Ref: TelegramToken
+        ANTHROPIC_API_KEY:
+          Ref: AnthropicApiKey
+        WAAIAS_API_KEY:
+          Ref: WaaiasApiKey
+        X402_PRIVATE_KEY:
+          Ref: X402PrivateKey
+        DYNAMODB_TABLE:
+          Ref: AgentBotUsersTable
+        COINGECKO_API_KEY:
+          Ref: CoingeckoApiKey
+Parameters:
+  TelegramToken:
+    Type: String
+    NoEcho: true
+  AnthropicApiKey:
+    Type: String
+    NoEcho: true
+  WaaiasApiKey:
+    Type: String
+    NoEcho: true
+  X402PrivateKey:
+    Type: String
+    NoEcho: true
+  CoingeckoApiKey:
+    Type: String
+    NoEcho: true
+    Default: ''
+Resources:
+  AgentBotUsersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      TableName: agent_bot_users
+      AttributeDefinitions:
+      - AttributeName: telegram_user_id
+        AttributeType: S
+      KeySchema:
+      - AttributeName: telegram_user_id
+        KeyType: HASH
+  WebhookFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: telegram-finance-webhook
+      Handler: handler.lambda_handler
+      Timeout: 30
+      CodeUri: WebhookFunction
+      Policies:
+      - DynamoDBCrudPolicy:
+          TableName:
+            Ref: AgentBotUsersTable
+      Events:
+        Webhook:
+          Type: Api
+          Properties:
+            Path: /webhook
+            Method: post
+    Metadata:
+      SamResourceId: WebhookFunction
+  ScheduledPaymentsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: telegram-finance-scheduled-payments
+      Handler: scheduler/payments.lambda_handler
+      Timeout: 300
+      CodeUri: ScheduledPaymentsFunction
+      Policies:
+      - DynamoDBCrudPolicy:
+          TableName:
+            Ref: AgentBotUsersTable
+      Events:
+        Hourly:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 hour)
+    Metadata:
+      SamResourceId: ScheduledPaymentsFunction
+  PriceAlertsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: telegram-finance-price-alerts
+      Handler: scheduler/price_alerts.lambda_handler
+      Timeout: 300
+      CodeUri: PriceAlertsFunction
+      Policies:
+      - DynamoDBCrudPolicy:
+          TableName:
+            Ref: AgentBotUsersTable
+      Events:
+        EveryFiveMinutes:
+          Type: Schedule
+          Properties:
+            Schedule: rate(5 minutes)
+    Metadata:
+      SamResourceId: PriceAlertsFunction
+  FeedDigestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: telegram-finance-feed-digest
+      Handler: scheduler/feed_digest.lambda_handler
+      Timeout: 300
+      CodeUri: FeedDigestFunction
+      Policies:
+      - DynamoDBCrudPolicy:
+          TableName:
+            Ref: AgentBotUsersTable
+      Events:
+        DailyAt8UTC:
+          Type: Schedule
+          Properties:
+            Schedule: cron(0 8 * * ? *)
+    Metadata:
+      SamResourceId: FeedDigestFunction
+Outputs:
+  WebhookUrl:
+    Description: API Gateway webhook URL for Telegram
+    Value:
+      Fn::Sub: https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/webhook
+  DynamoTableName:
+    Description: DynamoDB table name
+    Value:
+      Ref: AgentBotUsersTable
