@@ -23,6 +23,8 @@ Parameters:
   AnthropicApiKey:
     Type: String
     NoEcho: true
+    Default: ""
+    Description: Optional. Leave blank to disable AI Mode (Claude tool use).
   CoingeckoApiKey:
     Type: String
     NoEcho: true

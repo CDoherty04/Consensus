@@ -1,0 +1,304 @@
+TELEGRAM AI FINANCE BOT — OUTSTANDING WORK
+==========================================
+Generated: 2026-05-06
+Scope: gaps between current code in repo and the spec in
+       .kiro/specs/telegram-ai-finance-bot/{requirements,design,tasks}.md
+
+
+1. BLOCKCHAIN / x402 CLIENT (bot/wallet/x402_client.py)
+-------------------------------------------------------
+- _sign_and_send_transaction() returns a hard-coded mock hash ("0x000…0").
+  No actual signing or eth_sendRawTransaction is performed. Real signing with
+  eth_account / web3.py must be added before any mainnet use.
+- _send_erc20_transaction balance check is broken: _get_balance() for non-ETH
+  always returns 0.0 (placeholder), so every USDC/BTC/SOL send raises
+  InsufficientBalanceError. Need real ERC20 balanceOf() contract calls.
+- TOKEN_ADDRESSES has placeholder "0x..." values for BTC and SOL that will
+  blow up when used (zfill on a non-hex string). Need real wrapped-token
+  contract addresses on Base or remove from supported list.
+- _get_swap_quote() uses hard-coded mock USD rates ($2000 ETH, $40k BTC, etc.)
+  instead of querying a real DEX aggregator (0x, 1inch, Uniswap router, etc.).
+- _execute_swap() returns mock hash "0x111…1". No router approval, no
+  on-chain swap submission, no slippage handling beyond the in-memory check.
+- fetch_paywalled_content():
+    * _get_payment_info() returns mock {amount, token, recipient}; no real
+      x402 payment-required handshake (HTTP 402 + payment header parsing).
+    * _retrieve_content() returns a hard-coded mock article string; no real
+      gateway call with payment proof.
+- get_transaction_status() reads receipts but the rest of the pipeline never
+  gives it a real tx hash to check; no callers anywhere in the codebase.
+- Network passed to constructor is fixed at init time. handler.py never
+  reconfigures the X402Client when the user switches network in Settings,
+  so "Switch Network" is cosmetic only.
+- No web3 / eth_account dependency in requirements.txt or
+  scheduler/requirements.txt, so even adding real signing requires updating
+  requirements + Lambda layer size.
+
+
+2. WAIaaS CLIENT (bot/wallet/waaias_client.py)
+----------------------------------------------
+- Endpoint URL "https://api.waaias.com/v1" is a guessed placeholder; the
+  WAIaaS spec link points to a GitHub repo, not a hosted API. Must verify
+  the real base URL, auth scheme, and request/response shape.
+- ensure_wallet() in WalletService falls back to a SHA-256-derived fake
+  "0x…" address if WAIaaS returns nothing. Users get a wallet address you
+  CANNOT sign for. Either remove the fallback or gate on a real wallet
+  being created.
+- get_balance hard-codes blockchain="base" / network="mainnet"; ignores the
+  user's selected network ("base-sepolia", "optimism") entirely.
+- Uses print() for logging instead of the logger; not captured cleanly
+  in CloudWatch.
+- No method to retrieve / export the encrypted private key, but
+  handler.py "Export Key" advertises this feature.
+
+
+3. EXPORT PRIVATE KEY (handler.py _execute_action "export_key")
+---------------------------------------------------------------
+- Returns a fabricated string `enc::{last10}::{ts}` that is NOT an
+  encrypted key. Currently misleading and unsafe-looking. Either:
+    a) wire to a real WAIaaS export endpoint, OR
+    b) remove the action / replace with "not supported in WAaaS" copy.
+- No second-factor / auth challenge before export.
+
+
+4. NATURAL LANGUAGE MODE (bot/nl_mode.py)
+-----------------------------------------
+- No multi-turn tool_use loop. Today the code only handles ONE tool_use
+  block from the first Claude response and never sends tool_result back.
+  Multi-step intents ("get my balance, then send $5 to Alex") cannot work.
+- History stored as plain {role, content} text only; tool_use / tool_result
+  blocks are discarded, so Claude loses context on the next turn.
+- Heuristic fallback only handles balance / last-N-transactions / send /
+  alert. Many tools (swap, schedule, fetch_article, portfolio, contacts
+  add/list/remove, withdraw, invest, cancel_payment, subscribe_feed) have
+  no fallback at all.
+- send_money heuristic blindly grabs everything after " to " as the contact
+  name, including trailing punctuation ("send 5 USDC to alex.").
+- "alert" heuristic only knows BTC/ETH/SOL — no SPY/QQQ/USDC.
+- requires_confirmation is set per tool, but `add_funds` and `fetch_article`
+  (which spends money) are NOT in FINANCIAL_TOOLS and skip confirmation.
+- No system prompt mention of x402 capabilities, networks, or recurrence
+  syntax — Claude often guesses wrong.
+
+
+5. WEBHOOK HANDLER (handler.py)
+-------------------------------
+- Module-level `_services` dict is a global — fine for warm Lambda but
+  swallows config errors at first invocation; no graceful surface to user.
+- _get_env() raises RuntimeError if any var missing, which makes the
+  Lambda return 500 with no Telegram reply. Should fall back / message user.
+- "invest" action routes SPY and QQQ through swap_tokens(USDC -> ETH).
+  This is wrong; SPY/QQQ are not ERC20 on Base. Either remove from
+  SUPPORTED_INVEST_ASSETS or integrate a real tokenized-equity provider.
+- "schedule_payment" via NL infers recurrence by checking if "friday" is
+  in cron_or_datetime — extremely brittle. Need real cron / RRULE parsing.
+- _start_confirmation stores `pending_action` with action_params dict; if
+  user starts a NEW action before confirming, the old pending is silently
+  overwritten. No queue / no warning.
+- Pending action TTL is 600s; no background cleanup if user just disappears.
+- _handle_menu_text input flow is one giant if/elif on `awaiting_input.type`.
+  No state machine table; very easy to miss-handle / regress.
+- "search_articles" calls FeedService.search_articles() which returns a
+  fixed mock list pointing at "example-paywalled-news.com". No real search
+  index integration.
+- Article fetch result is dumped as raw HTML/text into Telegram in
+  3500-char chunks; no markdown sanitization, may break Telegram parser.
+- No retry / dead-letter on Telegram send failures inside the webhook.
+- No idempotency key against Telegram update_id, so a Telegram retry can
+  double-execute an action.
+- `lambda_handler` always returns 200 even when processing failed (so
+  Telegram doesn't retry). That's intentional but means failures are only
+  visible in CloudWatch — no user-facing surface for unknown errors.
+- mode:nl button on settings page is duplicated (both menu row and footer).
+
+
+6. MENU PAGES (bot/pages.py)
+----------------------------
+- Spec asks for per-page modules under bot/pages/page0.py … page4.py with
+  handle_pageN_action() functions and a PAGE_DEFINITIONS dict. The repo has
+  a single bot/pages.py with action constants and routing inlined into
+  handler.py. Either update spec or refactor.
+- "Page X/N" navigation button uses callback_data "nav:noop" but handler
+  doesn't explicitly handle it (falls through to "not supported" branch
+  visible to user if Telegram ever fires the callback).
+- No QR code generation for "Add Funds" / "Show Address" — just a link to
+  api.qrserver.com. Spec calls for inline QR.
+
+
+7. FEEDS (bot/feeds.py + scheduler/feed_digest.py)
+--------------------------------------------------
+- search_articles() returns 3 hard-coded mock entries built from the topic
+  string. No real paywalled-article search backend.
+- fetch_recent_items() only handles RSS 2.0 <item>; no Atom (<entry>),
+  no JSON Feed, no podcast feeds, no User-Agent header (some servers 403).
+- No de-duplication between digest runs; "fetch new since last_fetched"
+  is not actually filtered by pubDate — every digest may resend the same 5
+  items.
+- Paywalled-content micropayment from the spec ("Pay x402 micropayments
+  for paywalled content" 22.4) is NOT implemented in feed_digest.py.
+- No per-user notification_prefs check before sending the digest.
+- summarize_content uses Claude with no error context (no per-user style,
+  no length cap by item count, no chunking on >4096 chars).
+
+
+8. SCHEDULED PAYMENTS (scheduler/payments.py + bot/scheduler.py)
+---------------------------------------------------------------
+- calculate_next_run() in scheduler/payments.py is duplicated from
+  bot/scheduler.py with different semantics (one ignores cron_or_datetime).
+  Single source of truth needed.
+- "monthly" recurrence = +30 days, not real calendar months.
+- No timezone handling — spec says "store as UTC" but `cron_or_datetime`
+  parsing will accept naive ISO strings and assume UTC silently.
+- No max-retry / backoff on failed payment; one failure deletes nothing
+  but also doesn't retry — payment stays at the same next_run forever.
+- "once" payments default to next_run = now + 5 minutes if no datetime
+  given. Probably surprising UX. Should require an explicit time.
+- No notification_prefs check on failure path; user always gets the
+  failure DM even if they've muted scheduled-payment notifications.
+- Lambda iterates get_due_payments() — no per-user concurrency safety
+  if the same payment shows up in two scans (race window).
+
+
+9. PRICE ALERTS (scheduler/price_alerts.py)
+-------------------------------------------
+- Alerts are deleted as soon as triggered, but Telegram notification is
+  attempted AFTER deletion. If the send fails, alert is gone with no
+  notification — user never knows. Should send first, then delete.
+- No notification_prefs.price_alerts check before sending.
+- CoinGecko 429 / outage means alert is silently skipped each run with a
+  WARN log; no escalation if it has been failing for hours.
+- check_alert direction "above" triggers when current >= target — common
+  edge case where user already past the price when alert is created
+  (instant fire). No "must cross" semantics.
+- Hard-coded run rate (5 minutes) means up to 5-minute lag.
+
+
+10. DATA / DYNAMODB
+-------------------
+- Single table "agent_bot_users" with partition key telegram_user_id,
+  but contacts/alerts/scheduled_payments/subscriptions all live as LISTS
+  on the user item. AlertsDB / SubscriptionsDB / ScheduledPaymentsDB use
+  scan() to find cross-user records — won't scale beyond a small user
+  base and racks up RCU costs.
+- No GSI on next_run for due payments (full scan every hour).
+- update_user builds expressions but does not escape DynamoDB reserved
+  words for arbitrary nested keys (works for known top-level keys today).
+- Lists grow unbounded (transactions, history, contacts) — DynamoDB
+  400KB item limit will be hit eventually.
+- nl_conversation_history is trimmed to last 10 turns on write but
+  never compressed; long messages still bloat the item.
+- No backup / PITR enabled in template.yaml.
+- No encryption-at-rest config (defaults to AWS-managed KMS, OK but
+  not asserted in template).
+
+
+11. AWS SAM / DEPLOY (template.yaml + deploy.sh)
+------------------------------------------------
+- Env vars are passed as plaintext CloudFormation parameters with NoEcho.
+  Spec calls for SSM Parameter Store + IAM read access — not implemented.
+- No CloudWatch alarms, dashboards, or log retention configured.
+- No DLQ on any Lambda.
+- No reserved concurrency / throttling on the webhook function.
+- API Gateway endpoint has no auth, no rate-limit, no Telegram secret-token
+  header verification (anyone with the URL can post fake updates).
+- Single CodeUri "." packages everything for every Lambda — bigger cold
+  starts. Use Lambda Layers or per-function CodeUri.
+- deploy.sh assumes `sam` and `aws` are on PATH; no version checks; no
+  way to deploy to dev / staging stacks (STACK_NAME env only).
+
+
+12. SECURITY
+------------
+- No verification that incoming POST is actually from Telegram (no secret
+  token via setWebhook + X-Telegram-Bot-Api-Secret-Token check).
+- No rate-limiting per user_id (NL mode can burn Anthropic credits).
+- Pending-action confirmation never re-validates the original parameters
+  against current balance/network/contact (drift between init & confirm).
+- Wallet address echoed in plain text including export-key flow — fine for
+  address, dangerous if export ever returns a real key.
+- Logs include user_id and wallet_address (PII / linking risk); no
+  redaction policy.
+- No replay protection on confirm callback (user could press Yes twice).
+
+
+13. TESTS
+---------
+- No tests for handler.py (the largest module).
+- No tests for bot/wallet_service.py, bot/contacts.py, bot/alerts.py,
+  bot/scheduler.py, bot/feeds.py, bot/nl_mode.py.
+- No tests for scheduler/payments.py, scheduler/price_alerts.py,
+  scheduler/feed_digest.py.
+- No integration test wiring DB + handler with moto / localstack.
+- No CI configured (no .github/workflows or similar).
+- Existing tests for x402_client / waaias_client only verify mock
+  behavior, which is fine but locks the mock contract in.
+
+
+14. DOCS / DX
+-------------
+- README env-var name is `WAAIAS_API_KEY` but Configuration field /
+  template.yaml use the same; spec file mentions both spellings — verify
+  consistent (WAIaaS vs WAAIAS) everywhere.
+- No CONTRIBUTING.md, no architecture diagram, no runbook for common
+  failure modes.
+- TASK_1.2_SUMMARY.md and TASK_1.3_SUMMARY.md are dev artifacts that
+  should probably move to docs/ or be deleted.
+- .aws-sam/build/ committed by accident? It is not in .gitignore.
+- shared/example_usage.py is illustrative only — should be in docs/
+  or deleted.
+
+
+15. SPEC vs CODE DRIFT (things the spec promises but code skips)
+----------------------------------------------------------------
+- "Restore last viewed page when switching back to menu mode" — code
+  does keep current_page, but switching from NL -> Menu does not jump
+  back to the page the user was on; it always renders current_page=0
+  on /start.
+- Per-spec, "search paywalled index" should call a real provider.
+- Per-spec, feed digest must "Pay x402 micropayments for paywalled
+  content" — not done.
+- Per-spec, "Display [Yes] and [Cancel] inline buttons" with
+  preview-formatted text — current preview is just
+  `f"Got it — {tool_name} with {json.dumps(...)}"`. Needs human-friendly
+  formatting per action.
+- Per-spec, market_snapshot uses portfolio assets; current code uses
+  alert assets, falling back to a fixed list.
+- Per-spec, Page 4 "show address" should include network info AND a QR
+  code; QR is not generated.
+- Per-spec, request_money should "generate a payment link"; current link
+  uses the made-up `ethereum:` scheme with custom params, not EIP-681.
+
+
+16. NICE-TO-HAVES (not in spec but worth tracking)
+--------------------------------------------------
+- Internationalization / multi-language responses.
+- Per-user spending caps / daily limits before confirmation.
+- Tx receipt polling + follow-up notification when tx confirms.
+- Block-explorer link in confirmation messages (X402Client already has
+  get_explorer_url() — unused in handler).
+- Inline error reporting to a Sentry / observability backend.
+- Onboarding tutorial flow on first /start.
+
+
+PRIORITY ORDER (suggested)
+==========================
+P0 (blocks real use):
+  - Real signing in x402_client (item 1)
+  - Real WAIaaS endpoint + remove fake-wallet fallback (item 2)
+  - Telegram webhook secret verification (item 12)
+  - Send-then-delete order in price alerts (item 9)
+  - Fix invest path for SPY/QQQ or remove them (item 5)
+
+P1 (correctness / safety):
+  - Per-user notification_prefs gates everywhere (items 7, 8, 9)
+  - SSM Parameter Store + IAM + DLQ in template.yaml (item 11)
+  - Idempotency on Telegram update_id (item 5)
+  - Real cron / datetime parsing for schedules (item 5, 8)
+  - Multi-turn Claude tool_use loop (item 4)
+
+P2 (scale / polish):
+  - GSI for due payments / alerts (item 10)
+  - Per-page module refactor to match spec (item 6)
+  - Real article-search and feed-paywall integration (item 7)
+  - Tests for handler + schedulers + CI (item 13)
+  - Cleanup of summary .md files and .aws-sam/build leakage (item 14)

@@ -34,13 +34,14 @@ It uses:
 
 Required:
 - `TELEGRAM_TOKEN`
-- `ANTHROPIC_API_KEY`
 - `DYNAMODB_TABLE` (default `agent_bot_users`)
 - `AWS_REGION`
 - `WALLET_KMS_KEY_ID` — KMS key/alias used to encrypt user wallet keys
   (the SAM template provisions `alias/agent-bot-wallet` automatically)
 
 Optional:
+- `ANTHROPIC_API_KEY` — enables AI Mode (Claude tool use). If unset, the
+  AI Mode button shows a friendly placeholder and the bot stays in menu mode.
 - `WALLET_NETWORK` — `base-sepolia` (default) | `base-mainnet` | `optimism`
 - `COINGECKO_API_KEY`
 

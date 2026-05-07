@@ -37,7 +37,7 @@ from bot.utils.validation import (
     validate_url,
     validate_wallet_address,
 )
-from bot.wallet.waaias_client import WAIaaSClient
+from bot.wallet.aws_wallet import AWSWallet
 from bot.wallet.x402_client import X402Client
 from bot.wallet_service import WalletService
 from bot.utils.coingecko_client import CoinGeckoClient
@@ -73,11 +73,14 @@ def _get_services() -> Dict[str, Any]:
     subscriptions_db = SubscriptionsDB(table_name, region=region)
 
     prices = CoinGeckoClient(coingecko_api_key)
-    waaias_key = os.getenv("WAAIAS_API_KEY", "")
-    x402_key = os.getenv("X402_PRIVATE_KEY", "")
-    waaias = WAIaaSClient(api_key=waaias_key)
-    x402 = X402Client(private_key=x402_key or f"0x{'0' * 64}")
-    wallet = WalletService(waaias_client=waaias, x402_client=x402, prices_client=prices)
+    network = os.getenv("WALLET_NETWORK", "base-sepolia")
+    aws_wallet = AWSWallet(
+        user_db=user_db,
+        kms_key_id=os.getenv("WALLET_KMS_KEY_ID", ""),
+        network=network,
+    )
+    x402 = X402Client(wallet=aws_wallet)
+    wallet = WalletService(aws_wallet=aws_wallet, x402_client=x402, prices_client=prices)
 
     _services.update(
         {
@@ -89,6 +92,7 @@ def _get_services() -> Dict[str, Any]:
             "feeds": FeedService(subscriptions_db),
             "wallet": wallet,
             "nl": NLModeService(api_key=os.getenv("ANTHROPIC_API_KEY", "")),
+            "nl_enabled": bool(os.getenv("ANTHROPIC_API_KEY", "")),
         }
     )
     return _services
@@ -116,8 +120,8 @@ def _ensure_user(user_id: str, services: Dict[str, Any]) -> Dict[str, Any]:
         return user
 
     wallet: WalletService = services["wallet"]
-    address = wallet.ensure_wallet(user_id)
-    user_db.create_user(user_id=user_id, wallet_address=address)
+    # AWSWallet handles both key generation (KMS) and DynamoDB user creation.
+    wallet.ensure_wallet(user_id)
     return user_db.get_user(user_id) or {}
 
 
@@ -212,12 +216,13 @@ def _execute_action(
 
     if action_name == "withdraw_funds":
         tx_hash = wallet.send(
-            wallet_address=wallet_address,
+            user_id=user_id,
             destination_address=params["destination_address"],
             amount=float(params["amount"]),
             currency=params.get("currency", "ETH"),
         )
-        return f"✅ Withdrawal sent.\nTx: <code>{tx_hash}</code>"
+        explorer = wallet.x402.get_explorer_url(tx_hash)
+        return f"✅ Withdrawal sent.\nTx: <code>{tx_hash}</code>\n{explorer}"
 
     if action_name == "send_money":
         destination = contacts.resolve_name_or_address(
@@ -226,16 +231,17 @@ def _execute_action(
         if not destination:
             raise ValueError("Unknown contact/address.")
         tx_hash = wallet.send(
-            wallet_address=wallet_address,
+            user_id=user_id,
             destination_address=destination,
             amount=float(params["amount"]),
             currency=params.get("currency", "USDC"),
         )
-        return f"✅ Payment sent.\nTx: <code>{tx_hash}</code>"
+        explorer = wallet.x402.get_explorer_url(tx_hash)
+        return f"✅ Payment sent.\nTx: <code>{tx_hash}</code>\n{explorer}"
 
     if action_name == "swap_tokens":
         tx_hash = wallet.swap(
-            wallet_address=wallet_address,
+            user_id=user_id,
             from_token=params["from_token"],
             to_token=params["to_token"],
             amount=float(params["amount"]),
@@ -244,18 +250,23 @@ def _execute_action(
 
     if action_name == "invest":
         asset = params.get("asset_symbol", "ETH").upper()
+        if asset in {"SPY", "QQQ"}:
+            raise ValueError(
+                f"{asset} is not available on this network. "
+                "Tokenized equity providers are not wired up in this build."
+            )
+        if asset == "USDC":
+            raise ValueError("USDC buy not needed. Use Add Funds instead.")
         usd = float(params.get("amount", 0))
         price = wallet.prices.get_price(asset)
         if not price:
             raise ValueError(f"Price unavailable for {asset}.")
         qty = usd / price
-        if asset == "USDC":
-            raise ValueError("USDC buy not needed. Use Add Funds instead.")
-        tx_hash = wallet.swap(wallet_address, "USDC", "ETH" if asset == "SPY" or asset == "QQQ" else asset, qty)
+        tx_hash = wallet.swap(user_id, "USDC", asset, qty)
         return f"✅ Invest order submitted for {asset}.\nTx: <code>{tx_hash}</code>"
 
     if action_name == "fetch_article":
-        content = wallet.fetch_article(wallet_address, params["url"])
+        content = wallet.fetch_article(user_id, params["url"])
         return content
 
     if action_name == "set_price_alert":
@@ -630,6 +641,11 @@ def _handle_action_callback(
         return
     if callback_data.startswith("network:set:"):
         network = callback_data.split(":")[-1]
+        try:
+            services["wallet"].use_network(network)
+        except ValueError as exc:
+            send_message(services["telegram_token"], chat_id, f"❌ {exc}")
+            return
         _update_user(user_id, services, {"network": network})
         send_message(services["telegram_token"], chat_id, f"✅ Network switched to <code>{network}</code>")
         _render_menu(chat_id, user_id, services, message_id=message_id)
@@ -922,6 +938,21 @@ def _handle_menu_text(message_text: str, chat_id: str, user: Dict[str, Any], ser
 
 def _handle_nl_text(message_text: str, chat_id: str, user: Dict[str, Any], services: Dict[str, Any]) -> None:
     user_id = user["telegram_user_id"]
+
+    if not services.get("nl_enabled"):
+        # Auto-bounce them back to menu mode so they're not stuck.
+        _update_user(user_id, services, {"interaction_mode": "menu"})
+        send_message(
+            services["telegram_token"],
+            chat_id,
+            (
+                "🧠 <b>AI Mode is not enabled in this build.</b>\n"
+                "Switched you back to the menu — use the inline buttons."
+            ),
+        )
+        _render_menu(chat_id, user_id, services)
+        return
+
     history = user.get("nl_conversation_history", [])[-10:]
 
     balances = {}
@@ -1010,6 +1041,17 @@ def _handle_callback(update: Dict[str, Any], services: Dict[str, Any]) -> None:
         return
 
     if callback_data == "mode:nl":
+        if not services.get("nl_enabled"):
+            send_message(
+                services["telegram_token"],
+                chat_id,
+                (
+                    "🧠 <b>AI Mode is not enabled in this build.</b>\n"
+                    "Set <code>ANTHROPIC_API_KEY</code> and redeploy to turn it on. "
+                    "Use the menu for now."
+                ),
+            )
+            return
         _update_user(user_id, services, {"interaction_mode": "nl"})
         edit_message(
             services["telegram_token"],

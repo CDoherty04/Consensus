@@ -92,6 +92,7 @@ def _get_services() -> Dict[str, Any]:
             "feeds": FeedService(subscriptions_db),
             "wallet": wallet,
             "nl": NLModeService(api_key=os.getenv("ANTHROPIC_API_KEY", "")),
+            "nl_enabled": bool(os.getenv("ANTHROPIC_API_KEY", "")),
         }
     )
     return _services
@@ -937,6 +938,21 @@ def _handle_menu_text(message_text: str, chat_id: str, user: Dict[str, Any], ser
 
 def _handle_nl_text(message_text: str, chat_id: str, user: Dict[str, Any], services: Dict[str, Any]) -> None:
     user_id = user["telegram_user_id"]
+
+    if not services.get("nl_enabled"):
+        # Auto-bounce them back to menu mode so they're not stuck.
+        _update_user(user_id, services, {"interaction_mode": "menu"})
+        send_message(
+            services["telegram_token"],
+            chat_id,
+            (
+                "🧠 <b>AI Mode is not enabled in this build.</b>\n"
+                "Switched you back to the menu — use the inline buttons."
+            ),
+        )
+        _render_menu(chat_id, user_id, services)
+        return
+
     history = user.get("nl_conversation_history", [])[-10:]
 
     balances = {}
@@ -1025,6 +1041,17 @@ def _handle_callback(update: Dict[str, Any], services: Dict[str, Any]) -> None:
         return
 
     if callback_data == "mode:nl":
+        if not services.get("nl_enabled"):
+            send_message(
+                services["telegram_token"],
+                chat_id,
+                (
+                    "🧠 <b>AI Mode is not enabled in this build.</b>\n"
+                    "Set <code>ANTHROPIC_API_KEY</code> and redeploy to turn it on. "
+                    "Use the menu for now."
+                ),
+            )
+            return
         _update_user(user_id, services, {"interaction_mode": "nl"})
         edit_message(
             services["telegram_token"],

@@ -9,6 +9,7 @@ from bot.db.contacts import ContactsDB
 from bot.db.scheduled_payments import ScheduledPaymentsDB
 from bot.db.user_state import UserStateDB
 from bot.utils.telegram import send_message
+from bot.wallet.aws_wallet import AWSWallet
 from bot.wallet.x402_client import X402Client
 
 logger = logging.getLogger()
@@ -31,10 +32,15 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     table = os.environ["DYNAMODB_TABLE"]
     region = os.getenv("AWS_REGION", "us-east-1")
     token = os.environ["TELEGRAM_TOKEN"]
-    x402 = X402Client(private_key=os.environ["X402_PRIVATE_KEY"])
     user_db = UserStateDB(table, region=region)
     contacts_db = ContactsDB(table, region=region)
     payments_db = ScheduledPaymentsDB(table, region=region)
+    aws_wallet = AWSWallet(
+        user_db=user_db,
+        kms_key_id=os.getenv("WALLET_KMS_KEY_ID", ""),
+        network=os.getenv("WALLET_NETWORK", "base-sepolia"),
+    )
+    x402 = X402Client(wallet=aws_wallet)
 
     processed = 0
     succeeded = 0
@@ -56,12 +62,16 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             if not contact:
                 raise ValueError("Contact not found for payment.")
 
-            tx_hash = x402.send_transaction(
-                from_address=user.get("wallet_address"),
-                to_address=contact.get("address"),
-                amount=float(payment.get("amount", 0)),
-                token=payment.get("currency", "USDC"),
-            )
+            signer = aws_wallet.load_wallet(user_id)
+            try:
+                tx_hash = x402.send_transaction(
+                    signer=signer,
+                    to_address=contact.get("address"),
+                    amount=float(payment.get("amount", 0)),
+                    token=payment.get("currency", "USDC"),
+                )
+            finally:
+                signer.private_key = ""
 
             if recurrence == "once":
                 payments_db.delete_payment(payment_id, user_id=user_id)

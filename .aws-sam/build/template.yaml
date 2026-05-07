@@ -1,6 +1,6 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
-Description: Telegram AI Finance Bot serverless stack
+Description: Telegram AI Finance Bot serverless stack (KMS-backed wallets + x402)
 Globals:
   Function:
     Runtime: python3.12
@@ -12,14 +12,14 @@ Globals:
           Ref: TelegramToken
         ANTHROPIC_API_KEY:
           Ref: AnthropicApiKey
-        WAAIAS_API_KEY:
-          Ref: WaaiasApiKey
-        X402_PRIVATE_KEY:
-          Ref: X402PrivateKey
         DYNAMODB_TABLE:
           Ref: AgentBotUsersTable
         COINGECKO_API_KEY:
           Ref: CoingeckoApiKey
+        WALLET_KMS_KEY_ID:
+          Ref: AgentWalletKey
+        WALLET_NETWORK:
+          Ref: WalletNetwork
 Parameters:
   TelegramToken:
     Type: String
@@ -27,17 +27,41 @@ Parameters:
   AnthropicApiKey:
     Type: String
     NoEcho: true
-  WaaiasApiKey:
-    Type: String
-    NoEcho: true
-  X402PrivateKey:
-    Type: String
-    NoEcho: true
+    Default: ''
+    Description: Optional. Leave blank to disable AI Mode (Claude tool use).
   CoingeckoApiKey:
     Type: String
     NoEcho: true
     Default: ''
+  WalletNetwork:
+    Type: String
+    Default: base-sepolia
+    AllowedValues:
+    - base-sepolia
+    - base-mainnet
+    - optimism
 Resources:
+  AgentWalletKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Encrypts agent wallet private keys for the Telegram finance bot
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+        - Sid: EnableRoot
+          Effect: Allow
+          Principal:
+            AWS:
+              Fn::Sub: arn:aws:iam::${AWS::AccountId}:root
+          Action: kms:*
+          Resource: '*'
+  AgentWalletKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/agent-bot-wallet
+      TargetKeyId:
+        Ref: AgentWalletKey
   AgentBotUsersTable:
     Type: AWS::DynamoDB::Table
     Properties:
@@ -49,6 +73,10 @@ Resources:
       KeySchema:
       - AttributeName: telegram_user_id
         KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
   WebhookFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -60,6 +88,17 @@ Resources:
       - DynamoDBCrudPolicy:
           TableName:
             Ref: AgentBotUsersTable
+      - Statement:
+        - Effect: Allow
+          Action:
+          - kms:Encrypt
+          - kms:Decrypt
+          - kms:GenerateDataKey
+          - kms:DescribeKey
+          Resource:
+            Fn::GetAtt:
+            - AgentWalletKey
+            - Arn
       Events:
         Webhook:
           Type: Api
@@ -79,6 +118,15 @@ Resources:
       - DynamoDBCrudPolicy:
           TableName:
             Ref: AgentBotUsersTable
+      - Statement:
+        - Effect: Allow
+          Action:
+          - kms:Decrypt
+          - kms:DescribeKey
+          Resource:
+            Fn::GetAtt:
+            - AgentWalletKey
+            - Arn
       Events:
         Hourly:
           Type: Schedule
@@ -131,3 +179,13 @@ Outputs:
     Description: DynamoDB table name
     Value:
       Ref: AgentBotUsersTable
+  WalletKmsKeyArn:
+    Description: KMS key used to encrypt agent wallet private keys
+    Value:
+      Fn::GetAtt:
+      - AgentWalletKey
+      - Arn
+  WalletKmsKeyAlias:
+    Description: KMS alias for the wallet key
+    Value:
+      Ref: AgentWalletKeyAlias
