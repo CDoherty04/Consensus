@@ -11,3 +11,7 @@ anthropic>=0.18.0
 
 # Telegram Bot API library (for sending notifications)
 python-telegram-bot>=20.7
+
+# Wallet signing (used by scheduled payment executor)
+eth-account>=0.11.0
+eth-utils>=4.0.0

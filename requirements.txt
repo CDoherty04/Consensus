@@ -1,13 +1,13 @@
 # Telegram AI Finance Bot - Webhook Handler Dependencies
 
-# AWS SDK for DynamoDB
 boto3>=1.34.0
-
-# HTTP requests library
 requests>=2.31.0
-
-# Anthropic Claude API client
 anthropic>=0.18.0
-
-# Telegram Bot API library
 python-telegram-bot>=20.7
+
+# Wallet + signing (real on-chain transactions on Base / Base Sepolia)
+eth-account>=0.11.0
+eth-utils>=4.0.0
+
+# x402 payment protocol (Coinbase) — used for paywalled content fetches
+x402[requests]>=2.9.0
